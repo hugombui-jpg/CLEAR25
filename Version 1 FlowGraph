@@ -1,0 +1,395 @@
+"""Train C.L.E.A.R. station-level smoke-event warning models.
+
+For every station-hour, predict the probability that PM2.5 will rise at least
+15 ug/m3 above that station's normal level within 6, 12, and 24 hours.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+VENV_DIR = PROJECT_DIR / ".venv"
+VENV_PYTHON = VENV_DIR / "bin" / "python3"
+if VENV_PYTHON.is_file() and Path(sys.prefix) != VENV_DIR:
+    os.execv(
+        str(VENV_PYTHON),
+        [str(VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]],
+    )
+
+MATPLOTLIB_CONFIG_DIR = PROJECT_DIR / ".matplotlib"
+MATPLOTLIB_CONFIG_DIR.mkdir(exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(MATPLOTLIB_CONFIG_DIR))
+
+import matplotlib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import (
+    average_precision_score,
+    brier_score_loss,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+
+from open_meteo_weather import load_or_download_weather
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+CSV_PATH = PROJECT_DIR / "data" / "raw" / "naps" / "PM25_2023.csv"
+WEATHER_CACHE_PATH = (
+    PROJECT_DIR / "data" / "raw" / "open_meteo" / "weather_2023.csv"
+)
+OUTPUT_DIR = PROJECT_DIR / "data" / "processed" / "clear_station_alerts"
+HORIZONS = (6, 12, 24)
+EXCESS_THRESHOLD = 15.0
+RANDOM_STATE = 0
+
+
+def find_header_row(csv_path: Path) -> int:
+    with csv_path.open(encoding="utf-8-sig") as file:
+        for line_number, line in enumerate(file):
+            if line.startswith("Pollutant//Polluant,"):
+                return line_number
+    raise ValueError(f"Could not find the NAPS header in {csv_path}")
+
+
+def load_hourly_data(csv_path: Path) -> pd.DataFrame:
+    """Read NAPS and produce exactly one record per station and clock-hour."""
+    hour_columns = [f"H{hour:02d}//H{hour:02d}" for hour in range(1, 25)]
+    id_columns = [
+        "Method Code//Code Méthode",
+        "NAPS ID//Identifiant SNPA",
+        "City//Ville",
+        "Province/Territory//Province/Territoire",
+        "Latitude//Latitude",
+        "Longitude//Longitude",
+        "Date//Date",
+    ]
+    daily = pd.read_csv(
+        csv_path,
+        encoding="utf-8-sig",
+        skiprows=find_header_row(csv_path),
+        usecols=id_columns + hour_columns,
+        low_memory=False,
+    )
+    hourly = daily.melt(
+        id_vars=id_columns,
+        value_vars=hour_columns,
+        var_name="hour_column",
+        value_name="pm25",
+    )
+    hourly["pm25"] = pd.to_numeric(hourly["pm25"], errors="coerce").replace(-999, np.nan)
+    hour_ending = hourly["hour_column"].str.extract(r"H(\d{2})")[0].astype(int)
+    hourly["timestamp"] = pd.to_datetime(
+        hourly["Date//Date"], errors="coerce"
+    ) + pd.to_timedelta(hour_ending, unit="h")
+    hourly["station_id"] = hourly["NAPS ID//Identifiant SNPA"].astype("string")
+    hourly["latitude"] = pd.to_numeric(hourly["Latitude//Latitude"], errors="coerce")
+    hourly["longitude"] = pd.to_numeric(hourly["Longitude//Longitude"], errors="coerce")
+    hourly = (
+        hourly.groupby(["station_id", "timestamp"], as_index=False, sort=False)
+        .agg(
+            pm25=("pm25", "mean"),
+            latitude=("latitude", "median"),
+            longitude=("longitude", "median"),
+            city=("City//Ville", "first"),
+            province=("Province/Territory//Province/Territoire", "first"),
+        )
+        .sort_values(["station_id", "timestamp"])
+        .reset_index(drop=True)
+    )
+    return hourly
+
+
+def add_station_climatology(hourly: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
+    """Estimate each station's normal level using training-period data only."""
+    hourly = hourly.copy()
+    hourly["month"] = hourly["timestamp"].dt.month
+    hourly["hour"] = hourly["timestamp"].dt.hour
+    training = hourly.loc[hourly["timestamp"] < cutoff]
+    normal_by_hour = (
+        training.groupby(["station_id", "month", "hour"])["pm25"]
+        .median()
+        .rename("normal_pm25")
+        .reset_index()
+    )
+    station_normal = training.groupby("station_id")["pm25"].median()
+    global_normal = float(training["pm25"].median())
+    hourly = hourly.merge(normal_by_hour, on=["station_id", "month", "hour"], how="left")
+    hourly["normal_pm25"] = hourly["normal_pm25"].fillna(
+        hourly["station_id"].map(station_normal)
+    ).fillna(global_normal)
+    hourly["excess_pm25"] = hourly["pm25"] - hourly["normal_pm25"]
+    return hourly
+
+
+def _future_max(series: pd.Series, horizon: int) -> pd.Series:
+    """Maximum value strictly after now and no later than the horizon."""
+    return series.iloc[::-1].rolling(horizon, min_periods=horizon).max().iloc[::-1].shift(-1)
+
+
+def add_targets_and_history(hourly: pd.DataFrame) -> pd.DataFrame:
+    grouped_excess = hourly.groupby("station_id", sort=False)["excess_pm25"]
+    hourly["excess_lag_1"] = grouped_excess.shift(1)
+    hourly["excess_lag_3"] = grouped_excess.shift(3)
+    hourly["excess_lag_6"] = grouped_excess.shift(6)
+    hourly["trend_3h"] = (hourly["excess_pm25"] - hourly["excess_lag_3"]) / 3
+    hourly["trend_6h"] = (hourly["excess_pm25"] - hourly["excess_lag_6"]) / 6
+    shifted = grouped_excess.shift(1)
+    hourly["excess_mean_6h"] = (
+        shifted.groupby(hourly["station_id"], sort=False)
+        .rolling(6, min_periods=3)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+    hourly["excess_max_24h"] = (
+        shifted.groupby(hourly["station_id"], sort=False)
+        .rolling(24, min_periods=12)
+        .max()
+        .reset_index(level=0, drop=True)
+    )
+    for horizon in HORIZONS:
+        future_max = hourly.groupby("station_id", sort=False)["excess_pm25"].transform(
+            lambda series, h=horizon: _future_max(series, h)
+        )
+        hourly[f"future_max_excess_{horizon}"] = future_max
+        hourly[f"y{horizon}"] = (future_max >= EXCESS_THRESHOLD).astype("int8")
+        hourly.loc[future_max.isna(), f"y{horizon}"] = -1
+    return hourly
+
+
+def _distance_and_bearing(stations: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    lat = np.radians(stations["latitude"].to_numpy(dtype=float))
+    lon = np.radians(stations["longitude"].to_numpy(dtype=float))
+    dlat = lat[None, :] - lat[:, None]
+    dlon = lon[None, :] - lon[:, None]
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat[:, None]) * np.cos(lat[None, :]) * np.sin(dlon / 2) ** 2
+    distance = 2 * 6371.0 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+    y = np.sin(dlon) * np.cos(lat[None, :])
+    x = np.cos(lat[:, None]) * np.sin(lat[None, :]) - np.sin(lat[:, None]) * np.cos(lat[None, :]) * np.cos(dlon)
+    bearing = (np.degrees(np.arctan2(y, x)) + 360) % 360
+    return distance, bearing
+
+
+def add_upwind_travel_features(hourly: pd.DataFrame) -> pd.DataFrame:
+    """Add horizon-specific upwind excess weighted by smoke travel time."""
+    stations = (
+        hourly[["station_id", "latitude", "longitude"]]
+        .dropna()
+        .drop_duplicates("station_id")
+        .sort_values("station_id")
+        .reset_index(drop=True)
+    )
+    station_ids = stations["station_id"].astype(str).tolist()
+    distance, bearing = _distance_and_bearing(stations)
+    excess_grid = hourly.pivot(index="timestamp", columns="station_id", values="excess_pm25")
+    wind_direction_grid = hourly.pivot(index="timestamp", columns="station_id", values="wind_direction_10m")
+    wind_speed_grid = hourly.pivot(index="timestamp", columns="station_id", values="wind_speed_10m")
+    for grid in (excess_grid, wind_direction_grid, wind_speed_grid):
+        grid.columns = grid.columns.astype(str)
+
+    summaries = []
+    for target_position, target_id in enumerate(station_ids):
+        frame = pd.DataFrame({"timestamp": excess_grid.index, "station_id": target_id})
+        neighbours = np.flatnonzero(
+            (distance[target_position] >= 25) & (distance[target_position] <= 650)
+        )
+        neighbour_ids = [station_ids[position] for position in neighbours]
+        if not neighbour_ids or target_id not in wind_direction_grid:
+            for horizon in HORIZONS:
+                frame[f"upwind_excess_{horizon}"] = np.nan
+            frame["upwind_station_count"] = 0
+            summaries.append(frame)
+            continue
+        source_excess = excess_grid[neighbour_ids].to_numpy(dtype=float)
+        wind_from = wind_direction_grid[target_id].to_numpy(dtype=float)[:, None]
+        wind_kmh = np.maximum(wind_speed_grid[target_id].to_numpy(dtype=float)[:, None], 2.0)
+        source_bearing = bearing[target_position, neighbours][None, :]
+        angle = np.radians((source_bearing - wind_from + 180) % 360 - 180)
+        direction_weight = np.clip(np.cos(angle), 0, None) ** 2
+        travel_hours = distance[target_position, neighbours][None, :] / wind_kmh
+        finite_source = np.isfinite(source_excess)
+        for horizon in HORIZONS:
+            travel_weight = np.exp(-np.abs(travel_hours - horizon) / max(3.0, horizon / 2))
+            weights = direction_weight * travel_weight * finite_source
+            denominator = weights.sum(axis=1)
+            frame[f"upwind_excess_{horizon}"] = np.divide(
+                np.nansum(source_excess * weights, axis=1),
+                denominator,
+                out=np.full(len(frame), np.nan),
+                where=denominator > 0,
+            )
+        frame["upwind_station_count"] = finite_source.sum(axis=1)
+        summaries.append(frame)
+    network = pd.concat(summaries, ignore_index=True)
+    return hourly.merge(network, on=["station_id", "timestamp"], how="left")
+
+
+def build_features(hourly: pd.DataFrame) -> tuple[pd.DataFrame, dict[int, pd.Series]]:
+    hourly["hour_sin"] = np.sin(2 * np.pi * hourly["hour"] / 24)
+    hourly["hour_cos"] = np.cos(2 * np.pi * hourly["hour"] / 24)
+    hourly["day_of_year"] = hourly["timestamp"].dt.dayofyear
+    hourly["day_sin"] = np.sin(2 * np.pi * hourly["day_of_year"] / 365.25)
+    hourly["day_cos"] = np.cos(2 * np.pi * hourly["day_of_year"] / 365.25)
+    hourly["wind_direction_sin"] = np.sin(2 * np.pi * hourly["wind_direction_10m"] / 360)
+    hourly["wind_direction_cos"] = np.cos(2 * np.pi * hourly["wind_direction_10m"] / 360)
+    hourly["station_code"] = pd.factorize(hourly["station_id"], sort=True)[0]
+    features = [
+        "station_code",
+        "normal_pm25",
+        "pm25",
+        "excess_pm25",
+        "excess_lag_1",
+        "excess_lag_3",
+        "excess_lag_6",
+        "trend_3h",
+        "trend_6h",
+        "excess_mean_6h",
+        "excess_max_24h",
+        "upwind_excess_6",
+        "upwind_excess_12",
+        "upwind_excess_24",
+        "upwind_station_count",
+        "temperature_2m",
+        "relative_humidity_2m",
+        "precipitation",
+        "surface_pressure",
+        "wind_speed_10m",
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "hour_sin",
+        "hour_cos",
+        "day_sin",
+        "day_cos",
+    ]
+    X = hourly[features].astype("float32")
+    targets = {horizon: hourly[f"y{horizon}"] for horizon in HORIZONS}
+    return X, targets
+
+
+def classification_metrics(actual: np.ndarray, probability: np.ndarray) -> dict[str, float]:
+    predicted = probability >= 0.5
+    return {
+        "event_rate": float(actual.mean()),
+        "precision": float(precision_score(actual, predicted, zero_division=0)),
+        "recall": float(recall_score(actual, predicted, zero_division=0)),
+        "f1": float(f1_score(actual, predicted, zero_division=0)),
+        "pr_auc": float(average_precision_score(actual, probability)),
+        "roc_auc": float(roc_auc_score(actual, probability)) if np.unique(actual).size > 1 else float("nan"),
+        "brier": float(brier_score_loss(actual, probability)),
+    }
+
+
+def main() -> None:
+    if not CSV_PATH.is_file():
+        raise SystemExit(f"Expected NAPS file not found: {CSV_PATH}")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    hourly = load_hourly_data(CSV_PATH)
+    unique_times = hourly["timestamp"].drop_duplicates().sort_values()
+    cutoff = unique_times.iloc[int(len(unique_times) * 0.8)]
+    hourly = add_station_climatology(hourly, cutoff)
+    stations = hourly[["station_id", "latitude", "longitude"]].dropna().drop_duplicates("station_id")
+    weather = load_or_download_weather(
+        stations,
+        hourly["timestamp"].min().date().isoformat(),
+        hourly["timestamp"].max().date().isoformat(),
+        WEATHER_CACHE_PATH,
+    )
+    hourly = hourly.merge(weather, on=["station_id", "timestamp"], how="left")
+    hourly = add_targets_and_history(hourly)
+    hourly = add_upwind_travel_features(hourly)
+    X, targets = build_features(hourly)
+    train_mask = hourly["timestamp"] < cutoff
+    test_mask = ~train_mask
+    feature_valid = X[["excess_pm25", "excess_lag_3", "excess_lag_6"]].notna().all(axis=1)
+
+    print(f"Station-hours: {len(hourly):,}")
+    print(f"Stations: {hourly['station_id'].nunique()}")
+    print(f"Chronological test begins: {cutoff}")
+    print(f"Event definition: future excess >= {EXCESS_THRESHOLD:g} ug/m3")
+
+    results = hourly.loc[test_mask, ["timestamp", "station_id", "city", "province", "normal_pm25", "pm25"]].copy()
+    metrics: dict[str, dict[str, float]] = {}
+    models = {}
+    for horizon in HORIZONS:
+        valid_target = targets[horizon] >= 0
+        horizon_train = train_mask & feature_valid & valid_target
+        horizon_test = test_mask & feature_valid & valid_target
+        X_train = X.loc[horizon_train]
+        y_train = targets[horizon].loc[horizon_train].astype("int8")
+        X_test = X.loc[horizon_test]
+        y_test = targets[horizon].loc[horizon_test].astype("int8")
+        positive_weight = max(1.0, min(12.0, (len(y_train) - y_train.sum()) / max(1, y_train.sum())))
+        sample_weight = np.where(y_train.to_numpy() == 1, positive_weight, 1.0)
+        model = HistGradientBoostingClassifier(
+            learning_rate=0.07,
+            max_iter=400,
+            max_leaf_nodes=127,
+            min_samples_leaf=20,
+            l2_regularization=0.1,
+            early_stopping=True,
+            validation_fraction=0.1,
+            categorical_features=["station_code"],
+            random_state=RANDOM_STATE,
+        )
+        model.fit(X_train, y_train, sample_weight=sample_weight)
+        probability = model.predict_proba(X_test)[:, 1]
+        model_metrics = classification_metrics(y_test.to_numpy(), probability)
+
+        current_rule = (X_test["excess_pm25"].to_numpy() >= EXCESS_THRESHOLD).astype(float)
+        trend_projection = X_test["excess_pm25"].to_numpy() + np.maximum(
+            X_test["trend_3h"].to_numpy(), 0
+        ) * horizon
+        trend_rule = (trend_projection >= EXCESS_THRESHOLD).astype(float)
+        model_metrics["persistence_f1"] = f1_score(y_test, current_rule, zero_division=0)
+        model_metrics["trend_rule_f1"] = f1_score(y_test, trend_rule, zero_division=0)
+        metrics[f"y{horizon}"] = model_metrics
+        models[f"y{horizon}"] = model
+
+        probability_series = pd.Series(probability, index=X_test.index)
+        results[f"actual_y{horizon}"] = targets[horizon].reindex(results.index)
+        results[f"probability_y{horizon}"] = probability_series.reindex(results.index)
+        results[f"predicted_y{horizon}"] = (
+            results[f"probability_y{horizon}"] >= 0.5
+        ).astype("Int8")
+        print(
+            f"y{horizon}: PR-AUC={model_metrics['pr_auc']:.3f}, "
+            f"precision={model_metrics['precision']:.3f}, "
+            f"recall={model_metrics['recall']:.3f}, F1={model_metrics['f1']:.3f}; "
+            f"rules F1 persistence={model_metrics['persistence_f1']:.3f}, "
+            f"trend={model_metrics['trend_rule_f1']:.3f}"
+        )
+
+    results.to_csv(OUTPUT_DIR / "station_alert_predictions.csv", index=False)
+    with (OUTPUT_DIR / "metrics.json").open("w", encoding="utf-8") as file:
+        json.dump(metrics, file, indent=2)
+
+    figure, axis = plt.subplots(figsize=(8, 5))
+    labels = [f"{horizon} h" for horizon in HORIZONS]
+    model_f1 = [metrics[f"y{horizon}"]["f1"] for horizon in HORIZONS]
+    persistence_f1 = [metrics[f"y{horizon}"]["persistence_f1"] for horizon in HORIZONS]
+    positions = np.arange(len(HORIZONS))
+    axis.bar(positions - 0.18, model_f1, 0.36, label="C.L.E.A.R. model")
+    axis.bar(positions + 0.18, persistence_f1, 0.36, label="Persistence rule")
+    axis.set_xticks(positions, labels)
+    axis.set_ylim(0, 1)
+    axis.set_ylabel("F1 score")
+    axis.set_title("Station smoke-event warning performance")
+    axis.legend()
+    figure.tight_layout()
+    figure.savefig(OUTPUT_DIR / "model_vs_rule_f1.png", dpi=160)
+    plt.close(figure)
+    print(f"Saved predictions, metrics, and comparison plot to: {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
